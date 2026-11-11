@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>気体分子運動論ボルツマン分布シミュレーター</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+  <div class="max-w-3xl mx-auto px-4 py-6">
+    <h1 class="text-2xl font-bold text-center text-cyan-300 mb-1">気体分子運動論 ボルツマン分布シミュレーター</h1>
+    <p class="text-center text-gray-400 text-sm mb-4">マクスウェル-ボルツマン速度分布をリアルタイム可視化</p>
+
+    <!-- コントロール -->
+    <div class="bg-gray-800 rounded-xl p-4 mb-4 flex flex-wrap gap-4 items-center justify-center">
+      <div class="flex items-center gap-2">
+        <label for="temp-slider" class="text-sm text-gray-300" id="temp-label">温度: 300 K</label>
+        <input id="temp-slider" type="range" min="50" max="2000" value="300" step="10"
+          aria-label="温度スライダー（50K〜2000K）"
+          class="w-40 accent-cyan-400">
+      </div>
+      <div class="flex items-center gap-2">
+        <label class="text-sm text-gray-300">分子数:</label>
+        <span class="text-cyan-300 font-bold text-sm" id="mol-count">200</span>
+      </div>
+      <button id="toggle-btn" aria-label="シミュレーション開始・停止"
+        class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-2 rounded-lg text-sm font-semibold transition">一時停止</button>
+      <button id="reset-btn" aria-label="シミュレーションをリセット"
+        class="bg-gray-600 hover:bg-gray-500 text-white px-4 py-2 rounded-lg text-sm font-semibold transition">リセット</button>
+    </div>
+
+    <!-- メインキャンバス -->
+    <canvas id="sim-canvas" width="600" height="400"
+      class="w-full rounded-xl border border-gray-700 bg-gray-950 block mb-2"
+      aria-label="気体分子シミュレーション"></canvas>
+
+    <!-- ヒストグラムキャンバス -->
+    <canvas id="hist-canvas" width="600" height="150"
+      class="w-full rounded-xl border border-gray-700 bg-gray-950 block mb-4"
+      aria-label="速度分布ヒストグラム"></canvas>
+
+    <!-- 統計情報 -->
+    <div class="grid grid-cols-3 gap-3">
+      <div class="bg-gray-800 rounded-xl p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">平均速度</div>
+        <div id="stat-avg" class="text-lg font-bold text-cyan-300">— m/s</div>
+      </div>
+      <div class="bg-gray-800 rounded-xl p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">温度</div>
+        <div id="stat-temp" class="text-lg font-bold text-yellow-300">300 K</div>
+      </div>
+      <div class="bg-gray-800 rounded-xl p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">壁衝突数/秒</div>
+        <div id="stat-pressure" class="text-lg font-bold text-pink-300">— 回</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+    const simCanvas = document.getElementById('sim-canvas');
+    const histCanvas = document.getElementById('hist-canvas');
+    const sc = simCanvas.getContext('2d');
+    const hc = histCanvas.getContext('2d');
+
+    const W = 600, H = 400;
+    const HW = 600, HH = 150;
+    const NUM_MOL = 200;
+    const RADIUS = 4;
+    // 窒素分子の質量 (kg) × 1e26 でスケール
+    const kB = 1.380649e-23;
+    const MASS = 4.65e-26; // N2
+    const SPEED_SCALE = 0.5; // pixel/m/s scaling factor
+
+    let temperature = 300;
+    let running = true;
+    let molecules = [];
+    let wallCollisions = 0;
+    let wallCollisionAccum = 0;
+    let lastWallReset = performance.now();
+
+    function maxwell_speed(T) {
+      // Box-Muller for 2D Maxwell-Boltzmann
+      const sigma = Math.sqrt(kB * T / MASS);
+      const u1 = Math.random(), u2 = Math.random();
+      const r = sigma * Math.sqrt(-2 * Math.log(Math.max(u1, 1e-10)));
+      return { vx: r * Math.cos(2*Math.PI*u2), vy: r * Math.sin(2*Math.PI*u2) };
+    }
+
+    function initMolecules(T) {
+      molecules = [];
+      for (let i = 0; i < NUM_MOL; i++) {
+        const { vx, vy } = maxwell_speed(T);
+        molecules.push({
+          x: RADIUS + Math.random() * (W - 2*RADIUS),
+          y: RADIUS + Math.random() * (H - 2*RADIUS),
+          vx: vx * SPEED_SCALE,
+          vy: vy * SPEED_SCALE,
+        });
+      }
+    }
+
+    function rescaleVelocities(newT) {
+      const oldT = temperature;
+      const factor = Math.sqrt(newT / oldT);
+      molecules.forEach(m => {
+        m.vx *= factor;
+        m.vy *= factor;
+      });
+    }
+
+    function update() {
+      const dt = 0.5;
+      const newWallHits = { count: 0 };
+      molecules.forEach(m => {
+        m.x += m.vx * dt;
+        m.y += m.vy * dt;
+        if (m.x - RADIUS < 0) { m.x = RADIUS; m.vx = Math.abs(m.vx); newWallHits.count++; }
+        if (m.x + RADIUS > W) { m.x = W - RADIUS; m.vx = -Math.abs(m.vx); newWallHits.count++; }
+        if (m.y - RADIUS < 0) { m.y = RADIUS; m.vy = Math.abs(m.vy); newWallHits.count++; }
+        if (m.y + RADIUS > H) { m.y = H - RADIUS; m.vy = -Math.abs(m.vy); newWallHits.count++; }
+      });
+      wallCollisionAccum += newWallHits.count;
+
+      // 分子間衝突（近距離ペアの速度交換 O(n^2) 簡略版）
+      const diam = RADIUS * 2;
+      for (let i = 0; i < molecules.length; i++) {
+        for (let j = i+1; j < molecules.length; j++) {
+          const dx = molecules[j].x - molecules[i].x;
+          const dy = molecules[j].y - molecules[i].y;
+          const dist2 = dx*dx + dy*dy;
+          if (dist2 < diam*diam && dist2 > 0) {
+            // 衝突: 速度成分交換（1D射影）
+            const dist = Math.sqrt(dist2);
+            const nx = dx/dist, ny = dy/dist;
+            const v1n = molecules[i].vx*nx + molecules[i].vy*ny;
+            const v2n = molecules[j].vx*nx + molecules[j].vy*ny;
+            molecules[i].vx += (v2n - v1n)*nx;
+            molecules[i].vy += (v2n - v1n)*ny;
+            molecules[j].vx += (v1n - v2n)*nx;
+            molecules[j].vy += (v1n - v2n)*ny;
+            // 重なり解消
+            const overlap = diam - dist;
+            molecules[i].x -= nx * overlap * 0.5;
+            molecules[i].y -= ny * overlap * 0.5;
+            molecules[j].x += nx * overlap * 0.5;
+            molecules[j].y += ny * overlap * 0.5;
+          }
+        }
+      }
+    }
+
+    function drawSim() {
+      sc.clearRect(0, 0, W, H);
+      sc.fillStyle = '#030712';
+      sc.fillRect(0, 0, W, H);
+      molecules.forEach(m => {
+        const speed = Math.sqrt(m.vx*m.vx + m.vy*m.vy);
+        const sigma = Math.sqrt(kB * temperature / MASS) * SPEED_SCALE;
+        const ratio = Math.min(speed / (sigma * 2.5), 1);
+        // 速度で色変化: 遅=青、速=赤
+        const r = Math.round(ratio * 255);
+        const b = Math.round((1-ratio) * 200 + 55);
+        sc.beginPath();
+        sc.arc(m.x, m.y, RADIUS, 0, Math.PI*2);
+        sc.fillStyle = `rgb(${r},80,${b})`;
+        sc.fill();
+      });
+    }
+
+    function drawHistogram() {
+      hc.clearRect(0, 0, HW, HH);
+      hc.fillStyle = '#030712';
+      hc.fillRect(0, 0, HW, HH);
+
+      const speeds = molecules.map(m => Math.sqrt(m.vx*m.vx + m.vy*m.vy) / SPEED_SCALE);
+      const sigma = Math.sqrt(kB * temperature / MASS);
+      const maxSpeed = sigma * 4;
+      const bins = 40;
+      const counts = new Array(bins).fill(0);
+      speeds.forEach(s => {
+        const bin = Math.floor(s / maxSpeed * bins);
+        if (bin >= 0 && bin < bins) counts[bin]++;
+      });
+      const maxCount = Math.max(...counts, 1);
+
+      const padL = 10, padR = 10, padT = 10, padB = 20;
+      const chartW = HW - padL - padR;
+      const chartH = HH - padT - padB;
+      const binW = chartW / bins;
+
+      // 棒グラフ
+      counts.forEach((c, i) => {
+        const h = (c / maxCount) * chartH;
+        hc.fillStyle = `hsl(${200 - i*3},80%,55%)`;
+        hc.fillRect(padL + i*binW, padT + chartH - h, binW - 1, h);
+      });
+
+      // Maxwell-Boltzmann 理論曲線 (3D Maxwell)
+      hc.beginPath();
+      hc.strokeStyle = '#fbbf24';
+      hc.lineWidth = 2;
+      for (let i = 0; i <= bins*4; i++) {
+        const v = (i / (bins*4)) * maxSpeed;
+        const f = 4*Math.PI * Math.pow(1/(2*Math.PI*sigma*sigma), 1.5) * v*v * Math.exp(-v*v/(2*sigma*sigma));
+        const normF = f * maxSpeed / bins * NUM_MOL;
+        const x = padL + (v / maxSpeed) * chartW;
+        const y = padT + chartH - (normF / maxCount) * chartH;
+        if (i === 0) hc.moveTo(x, y); else hc.lineTo(x, y);
+      }
+      hc.stroke();
+
+      hc.fillStyle = '#9ca3af';
+      hc.font = '11px monospace';
+      hc.fillText('速度 →', HW - 60, HH - 4);
+      hc.fillStyle = '#fbbf24';
+      hc.fillText('理論曲線', padL + 2, padT + 12);
+    }
+
+    function updateStats() {
+      const speeds = molecules.map(m => Math.sqrt(m.vx*m.vx + m.vy*m.vy) / SPEED_SCALE);
+      const avg = speeds.reduce((a,b)=>a+b,0) / speeds.length;
+      document.getElementById('stat-avg').textContent = Math.round(avg) + ' m/s';
+      document.getElementById('stat-temp').textContent = temperature + ' K';
+
+      const now = performance.now();
+      const elapsed = (now - lastWallReset) / 1000;
+      if (elapsed >= 1) {
+        wallCollisions = Math.round(wallCollisionAccum / elapsed);
+        wallCollisionAccum = 0;
+        lastWallReset = now;
+      }
+      document.getElementById('stat-pressure').textContent = wallCollisions + ' 回';
+      document.getElementById('mol-count').textContent = NUM_MOL;
+    }
+
+    function loop() {
+      if (running) {
+        update();
+        drawSim();
+        drawHistogram();
+        updateStats();
+      }
+      requestAnimationFrame(loop);
+    }
+
+    document.getElementById('temp-slider').addEventListener('input', e => {
+      const newT = parseInt(e.target.value);
+      document.getElementById('temp-label').textContent = '温度: ' + newT + ' K';
+      rescaleVelocities(newT);
+      temperature = newT;
+    });
+
+    document.getElementById('toggle-btn').addEventListener('click', () => {
+      running = !running;
+      document.getElementById('toggle-btn').textContent = running ? '一時停止' : '再開';
+    });
+
+    document.getElementById('reset-btn').addEventListener('click', () => {
+      initMolecules(temperature);
+    });
+
+    initMolecules(temperature);
+    loop();
+  </script>
+</body>
+</html>
